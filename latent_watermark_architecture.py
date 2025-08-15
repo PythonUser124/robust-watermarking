@@ -1,16 +1,6 @@
 """
 latent_watermark_architecture.py
-================================
-
-This module defines a high level model architecture for embedding and
-extracting cryptographically verifiable watermarks inside latent diffusion
-models.  The goal of this file is to provide a clean, modular skeleton
-that can be extended into a full training pipeline.  The code here is
-inspired by the discussion of asymmetric latent watermarking using
-Fourier‐annulus bin hopping, lightweight MLP encoders/decoders and
-frozen Stable Diffusion weights.  Nothing in this file depends on
-running Stable Diffusion itself; instead we surface clear integration
-points for a diffusers pipeline or custom VAE/UNet.
+===============================
 
 The architecture is broken down into the following conceptual pieces:
 
@@ -32,11 +22,7 @@ The architecture is broken down into the following conceptual pieces:
   interpretability.  Users of this class are expected to implement
   inversion and training logic outside this file.
 
-This file intentionally omits an end–to–end training loop, image
-augmentation pipeline or unit tests.  These should be provided in
-separate scripts or notebooks according to project needs.  Docstrings
-and type hints are used liberally to clarify expected tensor shapes
-and behaviour.
+
 """
 
 from __future__ import annotations
@@ -75,93 +61,7 @@ except ImportError:
 # Helper classes
 ###############################################################################
 
-class BinScheduler:
-    """Selects Fourier‐annulus bins in a keyed, step‐dependent fashion.
-
-    A deployment key (bytes) seeds a pseudo–random number generator which is
-    used to choose `M` distinct bins from within a mid–frequency annulus on
-    a 2D FFT grid.  The annulus is defined in normalised frequency space
-    relative to Nyquist, with `r_min <= radius <= r_max`.  The same key
-    produces deterministic selections; different keys produce disjoint
-    allocations for forensic tracing.
-
-    Attributes
-    ----------
-    H, W : int
-        Spatial resolution of latent features (e.g. 64×64 for SD 1.5).
-    r_min, r_max : float
-        Inner and outer radii (expressed as fractions of Nyquist) of the
-        annulus from which bins may be drawn.
-    M : int
-        Number of bins to select per step.
-    key : bytes
-        The deployment key used to initialise the PRNG for bin selection.
-
-    Methods
-    -------
-    bins_for_step(t: int) -> torch.LongTensor
-        Returns a `(M, 2)` tensor of (y, x) indices within the FFT grid for
-        diffusion step ``t``.
-    pn_for_step(t: int) -> torch.Tensor
-        Returns a length–``M`` tensor of ±1 values to be used as a spread
-        spectrum sequence for step ``t``.
-    """
-
-    def __init__(self, H: int, W: int, r_min: float, r_max: float, M: int, key: bytes):
-        assert 0.0 < r_min < r_max < 1.0, "radii must lie between 0 and 1"
-        self.H = H
-        self.W = W
-        self.r_min = r_min
-        self.r_max = r_max
-        self.M = M
-        self.key = key
-        # Precompute annulus mask in fftshifted coordinates
-        yy, xx = torch.meshgrid(torch.arange(H), torch.arange(W), indexing="ij")
-        cy, cx = (H - 1) / 2.0, (W - 1) / 2.0
-        r = torch.sqrt((yy - cy) ** 2 + (xx - cx) ** 2) / (min(H, W) / 2.0)
-        mask = (r >= r_min) & (r <= r_max)
-        self.register_buffer = lambda name, tensor: setattr(self, name, tensor)
-        self.register_buffer("_annulus_mask", mask)
-
-    def _rng_for_step(self, t: int) -> torch.Generator:
-        """Create a per–step torch.Generator seeded from the deployment key.
-
-        We derive a 64–bit integer seed by hashing the deployment key with
-        the step index.  This ensures reproducibility across different
-        processes and hardware.
-        """
-        digest = hashlib.sha256(self.key + t.to_bytes(4, "big")).digest()
-        seed = int.from_bytes(digest[:8], "big") % (2 ** 31 - 1)
-        gen = torch.Generator(device=self._annulus_mask.device)
-        gen.manual_seed(seed)
-        return gen
-
-    def bins_for_step(self, t: int) -> torch.LongTensor:
-        """Return a tensor of (y, x) indices for step ``t``.
-
-        The returned indices are in fftshifted coordinates, meaning that the
-        zero frequency (DC) is at the centre of the grid.  To modify the
-        underlying complex spectrum, users should first apply
-        `torch.fft.fftshift` to their FFT, index at these positions, then
-        apply the inverse shift via `ifftshift` before calling `ifft2`.
-        """
-        mask = self._annulus_mask
-        candidates = mask.nonzero(as_tuple=False)  # (K, 2)
-        g = self._rng_for_step(t)
-        perm = torch.randperm(candidates.size(0), generator=g, device=candidates.device)
-        selected = candidates[perm[: self.M]]
-        return selected
-
-    def pn_for_step(self, t: int) -> torch.Tensor:
-        """Return ±1 PN sequence of length M for step ``t``.
-
-        A pseudo–noise sequence improves robustness by randomising the phase
-        of the embedded watermark bits.  The sequence is re–drawn per step.
-        """
-        g = self._rng_for_step(t)
-        pn = torch.randint(0, 2, (self.M,), generator=g, device=self._annulus_mask.device)
-        pn = pn.float().mul_(2).sub_(1)  # map {0,1} -> {-1,+1}
-        return pn
+# NOTE: The BinScheduler class has been removed to disable bin scheduling.
 
 
 class EncoderMLP(nn.Module):
@@ -364,14 +264,8 @@ class LatentWatermarkModel(nn.Module):
         self.config = config or LatentWatermarkConfig()
         self.device = device or torch.device("cpu")
         # Initialise scheduler and MLPs
-        self.scheduler = BinScheduler(
-            H=H,
-            W=W,
-            r_min=self.config.r_min,
-            r_max=self.config.r_max,
-            M=self.config.M,
-            key=key,
-        )
+        # BinScheduler disabled
+        self.scheduler = None
         self.encoder_mlp = EncoderMLP(
             bits_per_step=self.config.bits_per_step,
             M=self.config.M,
@@ -385,7 +279,6 @@ class LatentWatermarkModel(nn.Module):
             time_embed_dim=self.config.time_embed_dim,
         )
         # Register modules on chosen device
-        self.scheduler._annulus_mask = self.scheduler._annulus_mask.to(self.device)
         self.encoder_mlp.to(self.device)
         self.decoder_mlp.to(self.device)
 
@@ -613,6 +506,7 @@ class LatentWatermarkModel(nn.Module):
         raise NotImplementedError(
             "Interpretability analysis must be implemented externally."
         )
+
 
 ###############################################################################
 # Additional modules for training, augmentation and interpretability
@@ -884,7 +778,7 @@ def inject_mlp_on_vgg(model: nn.Module, encoder_mlp: EncoderMLP, layers: List[st
 
 
 __all__ = [
-    "BinScheduler",
+    # "BinScheduler",
     "EncoderMLP",
     "DecoderMLP",
     "LatentWatermarkConfig",
@@ -895,4 +789,3 @@ __all__ = [
     "InterpretabilityUtils",
     "inject_mlp_on_vgg",
 ]
-
